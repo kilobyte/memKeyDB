@@ -28,10 +28,17 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#define _GNU_SOURCE
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <execinfo.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <time.h>
 
 /* This function provide us access to the original libc free(). This is useful
  * for instance to free results obtained by backtrace_symbols(). We need
@@ -271,8 +278,49 @@ static void *zrealloc_pmem(void *ptr, size_t size) {
 }
 #endif
 
+#define LOGLEN 1024*1024*1024
+#define LOGSIZE LOGLEN*sizeof(uint64_t)
+#define NSEC 1000000000
+static uint64_t *log;
+static uint64_t logused;
+
 void *zmalloc(size_t size) {
-    return (size < pmem_threshold) ? zmalloc_dram(size) : zmalloc_pmem(size);
+    if (!log) {
+        int f = open("zmalloc.log", O_RDWR|O_CREAT|O_TRUNC, 0666);
+        if (f == -1) {
+            fprintf(stderr, "Couldn't create log: %m\n");
+            abort();
+        }
+        ftruncate(f, LOGSIZE);
+        log = mmap(0, LOGSIZE, PROT_WRITE, MAP_SHARED, f, 0);
+        if (log == MAP_FAILED) {
+            fprintf(stderr, "Mmap log failed: %m\n");
+            abort();
+        }
+        close(f);
+    }
+
+    struct logentry {
+        uint64_t size;
+        uint64_t duration;
+        uint64_t nframes;
+        uint64_t frames[];
+    } *le;
+    uint64_t nf;
+
+    le = (struct logentry *)log;
+    le->nframes = nf = backtrace((void**)&le->frames, 64);
+    le->size = size;
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    void *ret = (size < pmem_threshold) ? zmalloc_dram(size) : zmalloc_pmem(size);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    le->duration = (t1.tv_sec - t0.tv_sec) * NSEC + t1.tv_nsec - t0.tv_nsec;
+    if ((logused += nf + 3) < LOGLEN - 128)
+        log += nf + 3;
+    return ret;
 }
 
 /* Allocation and free functions that bypass the thread cache
